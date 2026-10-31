@@ -1,0 +1,602 @@
+<?php
+/**
+ * SLMOF Portal CMS — Ministry Communications & Content Management
+ * Manages: News Articles, Publications/PDF Uploads, Contact Inquiries, E-Services
+ * Access: super_admin, minister, director_general, state_minister
+ */
+require_once __DIR__ . '/config/db.php';
+
+// Role-based Access Control
+if (empty($_SESSION['user_id'])) {
+    header('Location: login.php');
+    exit;
+}
+$allowedRoles = ['super_admin', 'director_general', 'minister', 'state_minister'];
+if (!in_array($_SESSION['user_role'] ?? '', $allowedRoles)) {
+    header('Location: index.php?error=access_denied');
+    exit;
+}
+
+$pdo      = getDB();
+$userId   = (int)$_SESSION['user_id'];
+$userName = $_SESSION['user_name'] ?? 'User';
+$userRole = $_SESSION['user_role'] ?? '';
+
+$tab    = $_GET['tab']    ?? 'news';
+$action = $_GET['action'] ?? '';
+$editId = (int)($_GET['id'] ?? 0);
+
+// Flash messages
+$flash     = '';
+$flashType = 'success';
+if (isset($_SESSION['cms_flash'])) {
+    $flash     = $_SESSION['cms_flash'];
+    $flashType = $_SESSION['cms_flash_type'] ?? 'success';
+    unset($_SESSION['cms_flash'], $_SESSION['cms_flash_type']);
+}
+
+// Handle POST Actions
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $postAction = $_POST['_action'] ?? '';
+
+    // Save News Article
+    if ($postAction === 'save_news') {
+        $id          = (int)($_POST['id'] ?? 0);
+        $title       = trim($_POST['title'] ?? '');
+        $category    = trim($_POST['category'] ?? 'general');
+        $excerpt     = trim($_POST['excerpt'] ?? '');
+        $body        = trim($_POST['body'] ?? '');
+        $author      = trim($_POST['author'] ?? 'Communications Office');
+        $pubDate     = $_POST['published_date'] ?? date('Y-m-d');
+        $isFeatured  = isset($_POST['is_featured'])  ? 1 : 0;
+        $isPublished = isset($_POST['is_published']) ? 1 : 0;
+        $slug = strtolower(trim(preg_replace('/[^a-z0-9]+/', '-', $title), '-'));
+
+        $imageName = $_POST['existing_image'] ?? null;
+        if (!empty($_FILES['featured_image']['name'])) {
+            $ext = strtolower(pathinfo($_FILES['featured_image']['name'], PATHINFO_EXTENSION));
+            if (in_array($ext, ['jpg','jpeg','png','webp'])) {
+                $imageName  = 'news-' . time() . '.' . $ext;
+                move_uploaded_file($_FILES['featured_image']['tmp_name'], __DIR__ . '/uploads/news/' . $imageName);
+            }
+        }
+
+        if ($id > 0) {
+            $pdo->prepare("UPDATE news_articles SET title=?,slug=?,category=?,excerpt=?,body=?,featured_image=?,author=?,published_date=?,is_featured=?,is_published=? WHERE id=?")
+                ->execute([$title,$slug,$category,$excerpt,$body,$imageName,$author,$pubDate,$isFeatured,$isPublished,$id]);
+            $_SESSION['cms_flash'] = 'Article updated successfully.';
+        } else {
+            $pdo->prepare("INSERT INTO news_articles (slug,title,category,excerpt,body,featured_image,author,published_date,is_featured,is_published,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)")
+                ->execute([$slug,$title,$category,$excerpt,$body,$imageName,$author,$pubDate,$isFeatured,$isPublished,$userId]);
+            $_SESSION['cms_flash'] = 'Article published successfully.';
+        }
+        header('Location: portal-cms.php?tab=news'); exit;
+    }
+
+    // Save Publication
+    if ($postAction === 'save_publication') {
+        $id          = (int)($_POST['id'] ?? 0);
+        $title       = trim($_POST['title'] ?? '');
+        $category    = trim($_POST['category'] ?? 'general');
+        $subcategory = trim($_POST['subcategory'] ?? '');
+        $description = trim($_POST['description'] ?? '');
+        $author      = trim($_POST['author'] ?? '');
+        $fiscalYear  = trim($_POST['fiscal_year'] ?? '');
+        $pubDate     = $_POST['published_date'] ?? date('Y-m-d');
+        $isFeatured  = isset($_POST['is_featured']) ? 1 : 0;
+
+        $fileName = $_POST['existing_file'] ?? null;
+        $fileSize = $_POST['existing_file_size'] ?? '0 KB';
+        $fileType = 'application/pdf';
+
+        if (!empty($_FILES['pub_file']['name'])) {
+            $ext = strtolower(pathinfo($_FILES['pub_file']['name'], PATHINFO_EXTENSION));
+            if (in_array($ext, ['pdf','doc','docx','xlsx','xls'])) {
+                $fileName = 'pub-' . time() . '.' . $ext;
+                move_uploaded_file($_FILES['pub_file']['tmp_name'], __DIR__ . '/uploads/publications/' . $fileName);
+                $sz = $_FILES['pub_file']['size'];
+                $fileSize = $sz > 1048576 ? round($sz/1048576,1).' MB' : round($sz/1024).' KB';
+                $fileType = $_FILES['pub_file']['type'] ?? 'application/pdf';
+            }
+        }
+
+        $pubCode = 'PUB-' . date('Y') . '-' . str_pad($id ?: rand(100,999), 3, '0', STR_PAD_LEFT);
+
+        if ($id > 0) {
+            $pdo->prepare("UPDATE publications SET title=?,category=?,subcategory=?,description=?,file_name=?,file_path=?,file_size=?,file_type=?,fiscal_year=?,author=?,published_date=?,is_featured=? WHERE id=?")
+                ->execute([$title,$category,$subcategory,$description,$fileName,'uploads/publications/'.$fileName,$fileSize,$fileType,$fiscalYear,$author,$pubDate,$isFeatured,$id]);
+            $_SESSION['cms_flash'] = 'Publication updated.';
+        } else {
+            $pdo->prepare("INSERT INTO publications (pub_code,title,category,subcategory,description,file_name,file_path,file_size,file_type,fiscal_year,author,published_date,is_featured,status,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'published',?)")
+                ->execute([$pubCode,$title,$category,$subcategory,$description,$fileName,'uploads/publications/'.$fileName,$fileSize,$fileType,$fiscalYear,$author,$pubDate,$isFeatured,$userId]);
+            $_SESSION['cms_flash'] = 'Publication added.';
+        }
+        header('Location: portal-cms.php?tab=publications'); exit;
+    }
+
+    // Update Inquiry Status
+    if ($postAction === 'update_inquiry') {
+        $id          = (int)($_POST['id'] ?? 0);
+        $status      = trim($_POST['status'] ?? 'new');
+        $notes       = trim($_POST['response_notes'] ?? '');
+        $respondedAt = in_array($status, ['responded','resolved']) ? date('Y-m-d H:i:s') : null;
+        $pdo->prepare("UPDATE contact_inquiries SET status=?,response_notes=?,responded_at=? WHERE id=?")
+            ->execute([$status,$notes,$respondedAt,$id]);
+        $_SESSION['cms_flash'] = 'Inquiry status updated.';
+        header('Location: portal-cms.php?tab=inquiries'); exit;
+    }
+
+    // Delete Record
+    if ($postAction === 'delete') {
+        $id      = (int)($_POST['id'] ?? 0);
+        $delTab  = $_POST['del_tab'] ?? 'news';
+        $tableMap = ['news' => 'news_articles', 'publications' => 'publications'];
+        if (isset($tableMap[$delTab]) && $id > 0) {
+            $pdo->prepare("DELETE FROM {$tableMap[$delTab]} WHERE id=?")->execute([$id]);
+            $_SESSION['cms_flash']      = 'Record deleted.';
+            $_SESSION['cms_flash_type'] = 'warning';
+        }
+        header("Location: portal-cms.php?tab={$delTab}"); exit;
+    }
+}
+
+// Data Queries
+$newsItems    = db_select("SELECT * FROM news_articles ORDER BY published_date DESC LIMIT 50");
+$publications = db_select("SELECT * FROM publications ORDER BY published_date DESC LIMIT 50");
+$inquiries    = db_select("SELECT * FROM contact_inquiries ORDER BY created_at DESC LIMIT 100");
+$eservices    = db_select("SELECT * FROM eservices ORDER BY sort_order ASC");
+
+$newsCount      = count($newsItems);
+$pubCount       = count($publications);
+$newInquiries   = count(array_filter($inquiries, fn($i) => $i['status'] === 'new'));
+$totalInquiries = count($inquiries);
+
+$editNews = null;
+$editPub  = null;
+if ($tab === 'news'         && $action === 'edit' && $editId > 0) $editNews = db_row("SELECT * FROM news_articles WHERE id=$editId");
+if ($tab === 'publications' && $action === 'edit' && $editId > 0) $editPub  = db_row("SELECT * FROM publications  WHERE id=$editId");
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Portal CMS — SLMOF Communications</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Poppins:wght@600;700;800&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/lucide@latest"></script>
+<link rel="stylesheet" href="assets/css/admin.css">
+<style>
+:root{--g:#123D2B;--g-dark:#0B2A1E;--g-mid:#1a5237;--gold:#D4AF37;--bg:#f8fafc;--border:#e2e8f0;--muted:#64748b;--shadow:0 2px 12px rgba(0,0,0,.07);}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:#1e293b;}
+.wrap{max-width:1280px;margin:0 auto;padding:24px;}
+/* Header */
+.cms-hdr{background:linear-gradient(135deg,var(--g-dark),var(--g));color:#fff;padding:28px 24px;border-radius:16px;margin-bottom:24px;display:flex;justify-content:space-between;align-items:center;gap:16px;}
+.cms-hdr h1{font-family:'Poppins',sans-serif;font-size:1.4rem;font-weight:800;margin:0 0 4px;}
+.cms-hdr p{color:rgba(255,255,255,.65);font-size:.84rem;margin:0;}
+.hdr-actions{display:flex;gap:8px;flex-shrink:0;}
+/* Stats */
+.stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px;}
+.sc{background:#fff;border-radius:12px;padding:18px;border:1px solid var(--border);box-shadow:var(--shadow);display:flex;align-items:center;gap:14px;}
+.sc-icon{width:44px;height:44px;border-radius:10px;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.sc-val{font-family:'Poppins',sans-serif;font-size:1.7rem;font-weight:900;color:#0f172a;line-height:1;}
+.sc-lbl{font-size:.72rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.05em;margin-top:2px;}
+/* Tabs */
+.tabs{display:flex;gap:4px;background:#fff;border:1px solid var(--border);border-radius:12px;padding:5px;margin-bottom:20px;}
+.t{padding:9px 18px;border-radius:8px;font-size:.86rem;font-weight:600;color:var(--muted);text-decoration:none;display:flex;align-items:center;gap:6px;transition:all .2s;}
+.t.on{background:var(--g);color:#fff;}
+.t:hover:not(.on){background:#f1f5f9;color:#0f172a;}
+.tbadge{background:rgba(220,38,38,.12);color:#dc2626;font-size:.68rem;font-weight:800;padding:1px 6px;border-radius:10px;}
+.t.on .tbadge{background:rgba(255,255,255,.25);color:#fff;}
+/* Panel */
+.panel{background:#fff;border-radius:12px;border:1px solid var(--border);box-shadow:var(--shadow);overflow:hidden;}
+.ph{padding:16px 22px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;}
+.ph h2{font-size:.95rem;font-weight:800;color:#0f172a;margin:0;}
+/* Table */
+.tbl{width:100%;border-collapse:collapse;font-size:.84rem;}
+.tbl th{background:#f8fafc;color:var(--muted);font-size:.7rem;font-weight:700;text-transform:uppercase;padding:9px 13px;text-align:left;border-bottom:2px solid var(--border);white-space:nowrap;}
+.tbl td{padding:13px;border-bottom:1px solid #f1f5f9;vertical-align:middle;}
+.tbl tbody tr:hover{background:#f8fafc;}
+.tbl tbody tr:last-child td{border-bottom:none;}
+/* Badges */
+.b{display:inline-flex;align-items:center;gap:3px;font-size:.68rem;font-weight:700;text-transform:uppercase;padding:3px 8px;border-radius:20px;}
+.bg{background:#dcfce7;color:#166534;}.ba{background:#fef3c7;color:#92400e;}.bb{background:#dbeafe;color:#1e40af;}.br{background:#fee2e2;color:#991b1b;}.bz{background:#f1f5f9;color:#475569;}.bp{background:#f3e8ff;color:#7c3aed;}
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:5px;padding:8px 14px;border-radius:8px;font-size:.84rem;font-weight:700;cursor:pointer;border:none;text-decoration:none;transition:all .2s;}
+.btn-g{background:var(--g);color:#fff;}.btn-g:hover{background:var(--g-mid);}
+.btn-gold{background:var(--gold);color:var(--g-dark);}.btn-gold:hover{background:#f0d060;}
+.btn-ol{background:transparent;border:1.5px solid var(--border);color:#0f172a;}.btn-ol:hover{background:#f1f5f9;}
+.btn-r{background:#fee2e2;color:#991b1b;}.btn-r:hover{background:#fecaca;}
+.btn-sm{padding:5px 11px;font-size:.76rem;}
+/* Form collapse */
+.fc{background:#f8fafc;border:1px solid var(--border);border-radius:10px;padding:22px;margin-bottom:18px;}
+.fc h3{font-size:.92rem;font-weight:800;color:#0f172a;margin:0 0 18px;}
+.fg{display:grid;grid-template-columns:1fr 1fr;gap:18px;}
+.full{grid-column:1/-1;}
+.fg-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;}
+.fgrp{display:flex;flex-direction:column;gap:5px;}
+.fgrp label{font-size:.8rem;font-weight:700;color:#374151;}
+.fgrp input,.fgrp select,.fgrp textarea{padding:8px 11px;border:1.5px solid var(--border);border-radius:8px;font-size:.86rem;font-family:inherit;outline:none;width:100%;transition:border .2s,box-shadow .2s;}
+.fgrp input:focus,.fgrp select:focus,.fgrp textarea:focus{border-color:var(--g);box-shadow:0 0 0 3px rgba(18,61,43,.1);}
+.fgrp textarea{min-height:100px;resize:vertical;}
+.chk{display:flex;align-items:center;gap:7px;cursor:pointer;font-size:.84rem;}
+.chk input{width:auto;}
+.fa{display:flex;gap:8px;justify-content:flex-end;padding-top:14px;border-top:1px solid var(--border);margin-top:16px;}
+/* Upload zone */
+.uz{border:2px dashed var(--border);border-radius:8px;padding:20px;text-align:center;cursor:pointer;transition:all .2s;}
+.uz:hover{border-color:var(--g);background:#f0fdf4;}
+.uz p{color:var(--muted);font-size:.82rem;margin:6px 0 0;}
+/* Flash */
+.flash{padding:11px 18px;border-radius:8px;font-size:.86rem;font-weight:600;margin-bottom:18px;display:flex;align-items:center;gap:8px;}
+.flash-success{background:#dcfce7;color:#166534;border:1px solid #bbf7d0;}
+.flash-warning{background:#fef3c7;color:#92400e;border:1px solid #fde68a;}
+/* Rich text editor */
+.rte{border:1.5px solid var(--border);border-radius:8px;overflow:hidden;}
+.rte-bar{background:#f1f5f9;border-bottom:1px solid var(--border);padding:7px 10px;display:flex;gap:5px;}
+.rte-btn{background:#fff;border:1px solid var(--border);border-radius:4px;padding:3px 8px;font-size:.76rem;font-weight:700;cursor:pointer;}
+.rte-btn:hover{background:var(--g);color:#fff;border-color:var(--g);}
+#bodyEd{min-height:200px;padding:12px;outline:none;font-size:.87rem;line-height:1.7;}
+/* Inquiry response popover */
+.inq-msg{background:#f8fafc;border-radius:7px;padding:12px 14px;font-size:.85rem;color:#374151;line-height:1.6;white-space:pre-wrap;max-height:120px;overflow-y:auto;}
+details summary{list-style:none;}details summary::-webkit-details-marker{display:none;}
+details[open] .drp{display:block;}
+.drp{display:none;position:absolute;background:#fff;border:1px solid var(--border);border-radius:10px;padding:18px;z-index:50;width:360px;box-shadow:0 8px 32px rgba(0,0,0,.12);margin-top:8px;}
+@media(max-width:768px){.stats-row{grid-template-columns:repeat(2,1fr);}.fg,.fg-3{grid-template-columns:1fr;}.tabs{flex-wrap:wrap;}}
+</style>
+</head>
+<body>
+<?php require_once 'includes/header.php'; ?>
+<div class="wrap">
+
+<?php if ($flash): ?>
+<div class="flash flash-<?= htmlspecialchars($flashType) ?>">
+    <i data-lucide="<?= $flashType === 'success' ? 'check-circle' : 'alert-triangle' ?>" style="width:15px;height:15px;"></i>
+    <?= htmlspecialchars($flash) ?>
+</div>
+<?php endif; ?>
+
+<!-- CMS Header -->
+<div class="cms-hdr">
+    <div>
+        <h1><i data-lucide="layout-dashboard" style="width:18px;height:18px;vertical-align:middle;margin-right:8px;"></i> Portal Content Management</h1>
+        <p>Manage news, publications, e-services and citizen inquiries for the SLMOF public portal.</p>
+    </div>
+    <div class="hdr-actions">
+        <a href="http://127.0.0.1:8000/" target="_blank" class="btn btn-ol" style="background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.2);color:#fff;">
+            <i data-lucide="external-link" style="width:14px;height:14px;"></i> View Public Portal
+        </a>
+        <a href="index.php" class="btn btn-gold btn-sm">
+            <i data-lucide="arrow-left" style="width:13px;height:13px;"></i> Admin
+        </a>
+    </div>
+</div>
+
+<!-- Stats -->
+<div class="stats-row">
+    <div class="sc"><div class="sc-icon" style="background:#f0fdf4;color:#16a34a;"><i data-lucide="newspaper" style="width:20px;height:20px;"></i></div><div><div class="sc-val"><?= $newsCount ?></div><div class="sc-lbl">Articles</div></div></div>
+    <div class="sc"><div class="sc-icon" style="background:#dbeafe;color:#1d4ed8;"><i data-lucide="file-text" style="width:20px;height:20px;"></i></div><div><div class="sc-val"><?= $pubCount ?></div><div class="sc-lbl">Publications</div></div></div>
+    <div class="sc"><div class="sc-icon" style="background:#fef3c7;color:#d97706;"><i data-lucide="mail" style="width:20px;height:20px;"></i></div><div><div class="sc-val"><?= $newInquiries ?></div><div class="sc-lbl">New Inquiries</div></div></div>
+    <div class="sc"><div class="sc-icon" style="background:#f3e8ff;color:#7c3aed;"><i data-lucide="message-square" style="width:20px;height:20px;"></i></div><div><div class="sc-val"><?= $totalInquiries ?></div><div class="sc-lbl">Total Inquiries</div></div></div>
+</div>
+
+<!-- Tabs -->
+<div class="tabs">
+    <a href="?tab=news"         class="t <?= $tab==='news'?'on':'' ?>"><i data-lucide="newspaper" style="width:14px;height:14px;"></i> News Articles</a>
+    <a href="?tab=publications" class="t <?= $tab==='publications'?'on':'' ?>"><i data-lucide="file-text" style="width:14px;height:14px;"></i> Publications</a>
+    <a href="?tab=inquiries"    class="t <?= $tab==='inquiries'?'on':'' ?>">
+        <i data-lucide="mail" style="width:14px;height:14px;"></i> Inquiries
+        <?php if ($newInquiries > 0): ?><span class="tbadge"><?= $newInquiries ?></span><?php endif; ?>
+    </a>
+    <a href="?tab=eservices"    class="t <?= $tab==='eservices'?'on':'' ?>"><i data-lucide="grid" style="width:14px;height:14px;"></i> E-Services</a>
+</div>
+
+<?php /* ──── TAB: NEWS ──── */ if ($tab === 'news'): ?>
+
+<!-- News Add/Edit -->
+<div class="fc">
+    <h3><?= $editNews ? '✏️ Edit Article' : '+ New News Article' ?></h3>
+    <form method="POST" enctype="multipart/form-data">
+        <input type="hidden" name="_action" value="save_news">
+        <?php if ($editNews): ?><input type="hidden" name="id" value="<?= $editNews['id'] ?>"><?php endif; ?>
+        <div class="fg">
+            <div class="fgrp full">
+                <label>Headline / Title *</label>
+                <input type="text" name="title" required value="<?= htmlspecialchars($editNews['title'] ?? '') ?>" placeholder="e.g. SLMOF Launches Budget Transparency Initiative">
+            </div>
+            <div class="fgrp">
+                <label>Category</label>
+                <select name="category">
+                    <?php foreach(['budget_finance'=>'Budget & Finance','revenue'=>'Revenue','economic_development'=>'Economic Development','procurement'=>'Procurement','pfm_reform'=>'PFM Reform','general'=>'General'] as $v=>$l): ?>
+                    <option value="<?= $v ?>" <?= ($editNews['category']??'')===$v?'selected':'' ?>><?= $l ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="fgrp">
+                <label>Published Date</label>
+                <input type="date" name="published_date" value="<?= htmlspecialchars($editNews['published_date'] ?? date('Y-m-d')) ?>">
+            </div>
+            <div class="fgrp full">
+                <label>Excerpt (short summary)</label>
+                <textarea name="excerpt" rows="2" placeholder="Brief 1-2 sentence description..."><?= htmlspecialchars($editNews['excerpt'] ?? '') ?></textarea>
+            </div>
+            <div class="fgrp full">
+                <label>Article Body</label>
+                <div class="rte">
+                    <div class="rte-bar">
+                        <button type="button" class="rte-btn" onclick="document.execCommand('bold')"><b>B</b></button>
+                        <button type="button" class="rte-btn" onclick="document.execCommand('italic')"><i>I</i></button>
+                        <button type="button" class="rte-btn" onclick="document.execCommand('underline')"><u>U</u></button>
+                        <button type="button" class="rte-btn" onclick="wrapTag('p')">¶ Para</button>
+                        <button type="button" class="rte-btn" onclick="wrapTag('h3')">H3</button>
+                        <button type="button" class="rte-btn" onclick="wrapTag('ul')">List</button>
+                    </div>
+                    <div id="bodyEd" contenteditable="true"><?= $editNews['body'] ?? '' ?></div>
+                </div>
+                <input type="hidden" name="body" id="bodyInput">
+            </div>
+            <div class="fgrp">
+                <label>Author</label>
+                <input type="text" name="author" value="<?= htmlspecialchars($editNews['author'] ?? 'Communications Office') ?>">
+            </div>
+            <div class="fgrp">
+                <label>Featured Image (optional)</label>
+                <div class="uz" onclick="this.nextElementSibling.click()">
+                    <i data-lucide="image" style="width:22px;height:22px;color:#94a3b8;"></i>
+                    <p><?= !empty($editNews['featured_image']) ? '✓ Current: '.htmlspecialchars($editNews['featured_image']) : 'Click to upload (JPG, PNG, WebP)' ?></p>
+                </div>
+                <input type="file" name="featured_image" accept="image/*" style="display:none;" class="fup">
+                <input type="hidden" name="existing_image" value="<?= htmlspecialchars($editNews['featured_image'] ?? '') ?>">
+            </div>
+            <div class="fgrp" style="align-self:start;">
+                <label>&nbsp;</label>
+                <label class="chk"><input type="checkbox" name="is_featured" <?= ($editNews['is_featured']??0)?'checked':'' ?>> ★ Featured Article</label>
+                <label class="chk" style="margin-top:7px;"><input type="checkbox" name="is_published" <?= ($editNews['is_published']??1)?'checked':'' ?>> ● Published (live on portal)</label>
+            </div>
+        </div>
+        <div class="fa">
+            <?php if ($editNews): ?><a href="?tab=news" class="btn btn-ol">Cancel</a><?php endif; ?>
+            <button type="submit" class="btn btn-g" onclick="syncBody()">
+                <i data-lucide="save" style="width:14px;height:14px;"></i> <?= $editNews ? 'Update' : 'Publish Article' ?>
+            </button>
+        </div>
+    </form>
+</div>
+
+<!-- News List Table -->
+<div class="panel">
+    <div class="ph"><h2>All Articles (<?= $newsCount ?>)</h2></div>
+    <div style="overflow-x:auto;">
+    <table class="tbl">
+        <thead><tr><th>#</th><th>Title</th><th>Category</th><th>Date</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody>
+        <?php foreach ($newsItems as $n): ?>
+        <tr>
+            <td style="color:var(--muted);font-size:.75rem;"><?= $n['id'] ?></td>
+            <td>
+                <div style="font-weight:700;color:#0f172a;font-size:.88rem;"><?= htmlspecialchars($n['title']) ?></div>
+                <?php if ($n['is_featured']): ?><span class="b ba" style="font-size:.62rem;margin-top:3px;">★ Featured</span><?php endif; ?>
+            </td>
+            <td><span class="b bb"><?= htmlspecialchars(str_replace('_',' ',ucfirst($n['category']))) ?></span></td>
+            <td style="color:var(--muted);white-space:nowrap;font-size:.8rem;"><?= date('M d, Y', strtotime($n['published_date'])) ?></td>
+            <td><span class="b <?= $n['is_published']?'bg':'bz' ?>"><?= $n['is_published']?'● Live':'○ Draft' ?></span></td>
+            <td><div style="display:flex;gap:5px;">
+                <a href="?tab=news&action=edit&id=<?= $n['id'] ?>" class="btn btn-ol btn-sm">Edit</a>
+                <form method="POST" onsubmit="return confirm('Delete?')" style="display:inline;">
+                    <input type="hidden" name="_action" value="delete">
+                    <input type="hidden" name="id" value="<?= $n['id'] ?>">
+                    <input type="hidden" name="del_tab" value="news">
+                    <button class="btn btn-r btn-sm">Del</button>
+                </form>
+            </div></td>
+        </tr>
+        <?php endforeach; ?>
+        <?php if (empty($newsItems)): ?><tr><td colspan="6" style="text-align:center;padding:32px;color:var(--muted);">No articles yet.</td></tr><?php endif; ?>
+        </tbody>
+    </table>
+    </div>
+</div>
+
+<?php elseif ($tab === 'publications'): ?>
+
+<!-- Publication Add/Edit -->
+<div class="fc">
+    <h3><?= $editPub ? '✏️ Edit Publication' : '+ Upload New Publication' ?></h3>
+    <form method="POST" enctype="multipart/form-data">
+        <input type="hidden" name="_action" value="save_publication">
+        <?php if ($editPub): ?><input type="hidden" name="id" value="<?= $editPub['id'] ?>"><?php endif; ?>
+        <div class="fg">
+            <div class="fgrp full">
+                <label>Document Title *</label>
+                <input type="text" name="title" required value="<?= htmlspecialchars($editPub['title'] ?? '') ?>" placeholder="e.g. National Budget FY 2026-2027">
+            </div>
+            <div class="fgrp">
+                <label>Category</label>
+                <select name="category">
+                    <?php foreach(['budget'=>'Budget Documents','acts_regulations'=>'Acts & Regulations','magazines'=>'Magazines','taxes'=>'Tax Documents','reports'=>'Reports & Audits','projects'=>'Projects','general'=>'General'] as $v=>$l): ?>
+                    <option value="<?= $v ?>" <?= ($editPub['category']??'')===$v?'selected':'' ?>><?= $l ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="fgrp">
+                <label>Fiscal Year</label>
+                <select name="fiscal_year">
+                    <option value="">N/A</option>
+                    <?php foreach(['FY 2026-2027','FY 2025-2026','FY 2024-2025','FY 2023-2024'] as $fy): ?>
+                    <option value="<?= $fy ?>" <?= ($editPub['fiscal_year']??'')===$fy?'selected':'' ?>><?= $fy ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="fgrp">
+                <label>Author / Department</label>
+                <input type="text" name="author" value="<?= htmlspecialchars($editPub['author'] ?? '') ?>" placeholder="Budget Department">
+            </div>
+            <div class="fgrp">
+                <label>Publication Date</label>
+                <input type="date" name="published_date" value="<?= htmlspecialchars($editPub['published_date'] ?? date('Y-m-d')) ?>">
+            </div>
+            <div class="fgrp full">
+                <label>Description</label>
+                <textarea name="description" rows="2" placeholder="Brief description shown in downloads listing..."><?= htmlspecialchars($editPub['description'] ?? '') ?></textarea>
+            </div>
+            <div class="fgrp">
+                <label>Upload PDF / Document</label>
+                <div class="uz" onclick="this.nextElementSibling.click()">
+                    <i data-lucide="file-up" style="width:22px;height:22px;color:#94a3b8;"></i>
+                    <p><?= !empty($editPub['file_name']) ? '✓ Current: '.htmlspecialchars($editPub['file_name']).' ('.$editPub['file_size'].')' : 'Click to upload PDF, DOC, XLSX' ?></p>
+                </div>
+                <input type="file" name="pub_file" accept=".pdf,.doc,.docx,.xlsx,.xls" style="display:none;" class="fup">
+                <input type="hidden" name="existing_file" value="<?= htmlspecialchars($editPub['file_name'] ?? '') ?>">
+                <input type="hidden" name="existing_file_size" value="<?= htmlspecialchars($editPub['file_size'] ?? '0 KB') ?>">
+            </div>
+            <div class="fgrp" style="align-self:start;">
+                <label>&nbsp;</label>
+                <label class="chk"><input type="checkbox" name="is_featured" <?= ($editPub['is_featured']??0)?'checked':'' ?>> ★ Featured / Highlighted</label>
+            </div>
+        </div>
+        <div class="fa">
+            <?php if ($editPub): ?><a href="?tab=publications" class="btn btn-ol">Cancel</a><?php endif; ?>
+            <button type="submit" class="btn btn-g">
+                <i data-lucide="upload-cloud" style="width:14px;height:14px;"></i> <?= $editPub ? 'Update' : 'Upload & Publish' ?>
+            </button>
+        </div>
+    </form>
+</div>
+
+<!-- Publications Table -->
+<div class="panel">
+    <div class="ph"><h2>All Documents (<?= $pubCount ?>)</h2></div>
+    <div style="overflow-x:auto;">
+    <table class="tbl">
+        <thead><tr><th>Title</th><th>Category</th><th>Fiscal Year</th><th>File</th><th>Date</th><th>Actions</th></tr></thead>
+        <tbody>
+        <?php foreach ($publications as $pub): ?>
+        <tr>
+            <td>
+                <div style="font-weight:700;color:#0f172a;"><?= htmlspecialchars($pub['title']) ?></div>
+                <?php if ($pub['is_featured']): ?><span class="b ba" style="font-size:.62rem;">★ Featured</span><?php endif; ?>
+            </td>
+            <td><span class="b bb"><?= htmlspecialchars(str_replace('_',' ',ucfirst($pub['category']))) ?></span></td>
+            <td style="color:var(--muted);font-size:.8rem;"><?= htmlspecialchars($pub['fiscal_year'] ?? '—') ?></td>
+            <td><?php if ($pub['file_name']): ?>
+                <a href="uploads/publications/<?= htmlspecialchars($pub['file_name']) ?>" target="_blank" class="btn btn-ol btn-sm">
+                    <i data-lucide="download" style="width:12px;height:12px;"></i> <?= htmlspecialchars($pub['file_size'] ?? 'PDF') ?>
+                </a>
+            <?php else: ?><span style="color:#94a3b8;font-size:.78rem;">No file</span><?php endif; ?></td>
+            <td style="color:var(--muted);white-space:nowrap;font-size:.8rem;"><?= date('M d, Y', strtotime($pub['published_date'])) ?></td>
+            <td><div style="display:flex;gap:5px;">
+                <a href="?tab=publications&action=edit&id=<?= $pub['id'] ?>" class="btn btn-ol btn-sm">Edit</a>
+                <form method="POST" onsubmit="return confirm('Delete?')" style="display:inline;">
+                    <input type="hidden" name="_action" value="delete">
+                    <input type="hidden" name="id" value="<?= $pub['id'] ?>">
+                    <input type="hidden" name="del_tab" value="publications">
+                    <button class="btn btn-r btn-sm">Del</button>
+                </form>
+            </div></td>
+        </tr>
+        <?php endforeach; ?>
+        <?php if (empty($publications)): ?><tr><td colspan="6" style="text-align:center;padding:32px;color:var(--muted);">No publications yet.</td></tr><?php endif; ?>
+        </tbody>
+    </table>
+    </div>
+</div>
+
+<?php elseif ($tab === 'inquiries'): ?>
+
+<!-- Inquiries Table -->
+<div class="panel">
+    <div class="ph"><h2>Citizen Inquiries (<?= $totalInquiries ?> · <?= $newInquiries ?> new)</h2></div>
+    <div style="overflow-x:auto;">
+    <table class="tbl">
+        <thead><tr><th>#</th><th>From</th><th>Subject & Message</th><th>Category</th><th>Received</th><th>Status</th><th style="min-width:90px;">Action</th></tr></thead>
+        <tbody>
+        <?php foreach ($inquiries as $inq):
+            $sc = match($inq['status']) { 'new'=>'br','in_review'=>'ba','responded'=>'bb','resolved'=>'bg', default=>'bz' };
+        ?>
+        <tr>
+            <td style="color:var(--muted);font-size:.73rem;"><?= $inq['id'] ?></td>
+            <td>
+                <div style="font-weight:700;font-size:.86rem;"><?= htmlspecialchars($inq['full_name']) ?></div>
+                <div style="font-size:.72rem;color:var(--muted);"><?= htmlspecialchars($inq['email']) ?></div>
+                <?php if ($inq['phone']): ?><div style="font-size:.7rem;color:var(--muted);"><?= htmlspecialchars($inq['phone']) ?></div><?php endif; ?>
+            </td>
+            <td>
+                <div style="font-weight:600;font-size:.86rem;"><?= htmlspecialchars($inq['subject']) ?></div>
+                <div style="font-size:.72rem;color:var(--muted);margin-top:2px;"><?= htmlspecialchars(substr($inq['message'],0,90)) ?>...</div>
+            </td>
+            <td><span class="b bz"><?= htmlspecialchars(str_replace('_',' ',ucfirst($inq['category']))) ?></span></td>
+            <td style="white-space:nowrap;color:var(--muted);font-size:.76rem;"><?= date('M d, Y', strtotime($inq['created_at'])) ?><br><?= date('H:i', strtotime($inq['created_at'])) ?></td>
+            <td><span class="b <?= $sc ?>"><?= ucfirst(str_replace('_',' ',$inq['status'])) ?></span></td>
+            <td style="position:relative;">
+                <details>
+                    <summary class="btn btn-ol btn-sm">Respond</summary>
+                    <div class="drp">
+                        <div style="font-size:.76rem;font-weight:700;color:var(--muted);margin-bottom:7px;">From: <?= htmlspecialchars($inq['full_name']) ?> — <?= htmlspecialchars($inq['email']) ?></div>
+                        <div class="inq-msg"><?= htmlspecialchars($inq['message']) ?></div>
+                        <form method="POST" style="margin-top:14px;">
+                            <input type="hidden" name="_action" value="update_inquiry">
+                            <input type="hidden" name="id" value="<?= $inq['id'] ?>">
+                            <div class="fgrp" style="margin-bottom:9px;">
+                                <label style="font-size:.76rem;">Status</label>
+                                <select name="status">
+                                    <?php foreach(['new'=>'New','in_review'=>'In Review','responded'=>'Responded','resolved'=>'Resolved','closed'=>'Closed'] as $sv=>$sl): ?>
+                                    <option value="<?= $sv ?>" <?= $inq['status']===$sv?'selected':'' ?>><?= $sl ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="fgrp" style="margin-bottom:9px;">
+                                <label style="font-size:.76rem;">Internal Notes</label>
+                                <textarea name="response_notes" rows="2" style="font-size:.8rem;"><?= htmlspecialchars($inq['response_notes'] ?? '') ?></textarea>
+                            </div>
+                            <button type="submit" class="btn btn-g btn-sm" style="width:100%;">Save</button>
+                        </form>
+                    </div>
+                </details>
+            </td>
+        </tr>
+        <?php endforeach; ?>
+        <?php if (empty($inquiries)): ?><tr><td colspan="7" style="text-align:center;padding:32px;color:var(--muted);">No inquiries yet.</td></tr><?php endif; ?>
+        </tbody>
+    </table>
+    </div>
+</div>
+
+<?php elseif ($tab === 'eservices'): ?>
+
+<!-- E-Services Table -->
+<div class="panel">
+    <div class="ph">
+        <h2>E-Services Directory (<?= count($eservices) ?>)</h2>
+        <span style="font-size:.8rem;color:var(--muted);">These appear in the portal's Services section</span>
+    </div>
+    <div style="overflow-x:auto;">
+    <table class="tbl">
+        <thead><tr><th>Icon</th><th>Title</th><th>Category</th><th>URL</th><th>Badge</th><th>Status</th></tr></thead>
+        <tbody>
+        <?php foreach ($eservices as $svc): ?>
+        <tr>
+            <td><i data-lucide="<?= htmlspecialchars($svc['icon']) ?>" style="width:18px;height:18px;color:var(--g);"></i></td>
+            <td style="font-weight:700;font-size:.88rem;"><?= htmlspecialchars($svc['title']) ?></td>
+            <td><span class="b bz"><?= htmlspecialchars($svc['category']) ?></span></td>
+            <td style="font-size:.76rem;color:var(--muted);"><?= htmlspecialchars($svc['url'] ?? '—') ?></td>
+            <td><?php if ($svc['badge']): ?><span class="b bg"><?= htmlspecialchars($svc['badge']) ?></span><?php endif; ?></td>
+            <td><span class="b <?= $svc['is_active']?'bg':'bz' ?>"><?= $svc['is_active']?'Active':'Disabled' ?></span></td>
+        </tr>
+        <?php endforeach; ?>
+        <?php if (empty($eservices)): ?><tr><td colspan="6" style="text-align:center;padding:32px;color:var(--muted);">No services configured.</td></tr><?php endif; ?>
+        </tbody>
+    </table>
+    </div>
+</div>
+
+<?php endif; ?>
+</div>
+
+<?php require_once 'includes/footer.php'; ?>
+<script>
+if(typeof lucide!=='undefined') lucide.createIcons();
+function syncBody(){document.getElementById('bodyInput').value=document.getElementById('bodyEd').innerHTML;}
+function wrapTag(t){const ed=document.getElementById('bodyEd');ed.focus();const sel=window.getSelection();if(sel.rangeCount>0){const r=sel.getRangeAt(0),el=document.createElement(t);el.textContent=sel.toString()||'Text here';r.deleteContents();r.insertNode(el);}}
+document.querySelectorAll('.fup').forEach(i=>{i.addEventListener('change',()=>{const z=i.previousElementSibling;if(z&&z.classList.contains('uz')){const p=z.querySelector('p');if(p&&i.files[0])p.textContent='✓ '+i.files[0].name;z.style.borderColor='#123D2B';z.style.background='#f0fdf4';}});});
+</script>
+</body>
+</html>
